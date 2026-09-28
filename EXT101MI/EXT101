@@ -1,1 +1,250 @@
+/**
+   * README
+   * This extension is being used to Add or Update records to ATS101 MIATTR table.
+   *
+   * Name: EXT101MI.AddUpdMIATTR
+   * Description: Add or Update records to ATS101 MIATTR table
+   * Date	      Changed By                      Description
+   *20260908  akshayk@fortude.co     Add or Update calculated value to ATS101 MIATTR table 
+   */
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
+public class AddUpdMIATTR extends ExtendM3Transaction {
+  private final MIAPI mi
+  private final DatabaseAPI database
+  private final ProgramAPI program
+  private final MICallerAPI miCaller
+  // UtilityAPI removed — was injected but never used (XtendM3: inject only APIs that are used)
+
+  // Instance-level formatters — static fields are not supported in the XtendM3 sandbox
+  private final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyyMMdd")
+  private final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HHmmss")
+
+  private int iCONO, iAVSQ, iANSQ, iCOBT
+  private long iATNR
+  private String iATID, iCSIG, iITNO, iBANO, iATMO, iATTS, iAGET
+  private double iPCES, iATVN, calATVN
+  private boolean validInput = true
+  private boolean addInput = false
+
+  public AddUpdMIATTR(MIAPI mi, DatabaseAPI database, ProgramAPI program, MICallerAPI miCaller) {
+    this.mi = mi
+    this.database = database
+    this.program = program
+    this.miCaller = miCaller
+  }
+
+  public void main() {
+    iCONO = (mi.inData.get("CONO") == null || mi.inData.get("CONO").trim().isEmpty()) ? program.getLDAZD().CONO as Integer : mi.inData.get("CONO") as Integer
+    iATNR = (mi.inData.get("ATNR") == null || mi.inData.get("ATNR").trim().isEmpty()) ? 0 : mi.inData.get("ATNR") as Long
+    iPCES = (mi.inData.get("PCES") == null || mi.inData.get("PCES").trim().isEmpty()) ? 0 : mi.inData.get("PCES") as Double
+    iATID = (mi.inData.get("ATID") == null || mi.inData.get("ATID").trim().isEmpty()) ? "" : mi.inData.get("ATID")
+    iCSIG = (mi.inData.get("CSIG") == null || mi.inData.get("CSIG").trim().isEmpty()) ? "" : mi.inData.get("CSIG")
+    iITNO = (mi.inData.get("ITNO") == null || mi.inData.get("ITNO").trim().isEmpty()) ? "" : mi.inData.get("ITNO")
+    iBANO = (mi.inData.get("BANO") == null || mi.inData.get("BANO").trim().isEmpty()) ? "" : mi.inData.get("BANO")
+    iCOBT = (mi.inData.get("COBT") == null || mi.inData.get("COBT").trim().isEmpty()) ? 0 : mi.inData.get("COBT") as Integer
+    iATTS = (mi.inData.get("ATTS") == null || mi.inData.get("ATTS").trim().isEmpty()) ? "" : mi.inData.get("ATTS")
+    iAGET = (mi.inData.get("AGET") == null || mi.inData.get("AGET").trim().isEmpty()) ? "" : mi.inData.get("AGET")
+
+    validateInput()
+    // insert and update are mutually exclusive
+    if (addInput) {
+      AddMIATTR()
+    } else if (validInput) {
+      CalculateATVN()
+      UpdateMIATTR()
+    }
+  }
+
+  /**
+   * Validate Records
+   * @params
+   * @return
+   */
+  public void validateInput() {
+    // Validate CONO Company Number
+    Map<String, String> params = ["CONO": iCONO.toString().trim()]
+    Closure<?> callback = {
+      Map<String, String> response ->
+      if (response.CONO == null) {
+        mi.error("Invalid Company Number " + iCONO)
+        validInput = false
+        return
+      }
+    }
+    miCaller.call("MNS095MI", "Get", params, callback)
+    if (!validInput) return
+
+    // Validate Attribute no & attribute id
+    if ((iATNR.toInteger()) != 0 && !iATID.trim().isEmpty()) {
+      DBAction query = database.table("MIATTR").selection("AGANSQ", "AGAVSQ", "AGATVN").index("00").build()
+      DBContainer container2 = query.getContainer()
+
+      container2.setInt("AGCONO",    iCONO)
+      container2.setLong("AGATNR",   iATNR)
+      container2.setString("AGATID", iATID.trim())
+      int numRecord = query.readAll(container2, 3, 1, miattrRecordExist)
+      if (numRecord == 0) {
+        addInput = true
+        validInput = false
+        // intentionally continue — PCES, CSIG, ITNO, BANO still validated for insert path
+      }
+    } else {
+      mi.error("Attribute no & attribute id must enter " + iATNR + " & " + iATID)
+      validInput = false
+      return
+    }
+
+    if ((iPCES.toInteger()) == 0) {
+      mi.error("Pieces value must enter " + iPCES)
+      validInput = false
+      return
+    }
+
+    // CSIG validated against allowed values only
+    if (iCSIG != "+" && iCSIG != "-") {
+      mi.error("CSIG must be + or -, received: " + iCSIG)
+      validInput = false
+      return
+    }
+
+    if (iITNO.trim().isEmpty()) {
+      mi.error("ITNO value must enter " + iITNO)
+      validInput = false
+      return
+    } else {
+      // Validate Item Number
+      params = ["ITNO": iITNO.toString().trim()]
+      callback = {
+        Map<String, String> response ->
+        if (response.ITNO == null) {
+          mi.error("Invalid Item Number: " + iITNO)
+          validInput = false
+          return false
+        } else {
+          iATMO = response.ATMO
+        }
+      }
+      miCaller.call("MMS200MI", "Get", params, callback)
+      if (!validInput) return
+    }
+
+    if (iBANO.trim().isEmpty()) {
+      mi.error("BANO value must enter " + iBANO)
+      validInput = false
+      return
+    } else {
+      // Validate Lot Number
+      params = ["ITNO": iITNO.toString().trim(), "BANO": iBANO.toString().trim()]
+      callback = {
+        Map<String, String> response ->
+        if (response.BANO == null) {
+          mi.error("Invalid Lot Number: " + iBANO)
+          validInput = false
+          return false
+        }
+      }
+      miCaller.call("MMS235MI", "GetItmLot", params, callback)
+      if (!validInput) return
+    }
+  }
+
+  Closure<?> miattrRecordExist = {
+    DBContainer container ->
+    iAVSQ = container.getInt("AGAVSQ")
+    iANSQ = container.getInt("AGANSQ")
+    iATVN = container.getDouble("AGATVN")
+  }
+
+  /**
+   * Insert Record in table MIATTR
+   */
+  public void AddMIATTR() {
+    DBAction action = database.table("MIATTR").index("00").build()
+    DBContainer query = action.getContainer()
+
+    // capture once — consistent RGDT/RGTM/LMDT, no midnight edge case
+    LocalDateTime now = LocalDateTime.now()
+
+    query.setInt("AGCONO",    iCONO)
+    query.setLong("AGATNR",   iATNR)
+    query.setString("AGATID", iATID)
+    query.setInt("AGANSQ",    9)
+    query.setInt("AGAVSQ",    0)
+    query.setDouble("AGATVN", iPCES)
+    query.setString("AGITNO", iITNO)
+    query.setString("AGBANO", iBANO)
+    query.setInt("AGCOBT",    iCOBT)
+    query.setString("AGATTS", iATTS)
+    query.setString("AGATMO", iATMO)
+    query.setString("AGAGET", iAGET)
+    query.setInt("AGRGDT",    now.format(DATE_FMT).toInteger())
+    query.setInt("AGRGTM",    now.format(TIME_FMT).toInteger())
+    query.setInt("AGLMDT",    now.format(DATE_FMT).toInteger())
+    query.setInt("AGCHNO",    0)
+    query.setString("AGCHID", program.getUser())
+    action.insert(query, recordExists)
+
+    mi.outData.put("CONO", iCONO.toString())
+    mi.outData.put("ATNR", iATNR.toString())
+    mi.outData.put("ATID", iATID.toString())
+    mi.outData.put("ATVN", iPCES.toString())
+    mi.write()
+  }
+
+  Closure<?> recordExists = {
+    mi.error("Record Already Exists in MIATTR")
+    return
+  }
+
+  /**
+   * Calculate ATVN
+   */
+  public void CalculateATVN() {
+    if (iCSIG.trim().equals("+")) {
+      calATVN = iATVN + iPCES
+    } else {
+      // CSIG is guaranteed to be "-" — validated in validateInput()
+      calATVN = iATVN - iPCES
+    }
+  }
+
+  /**
+   * Update table MIATTR
+   */
+  public void UpdateMIATTR() {
+    DBAction query = database.table("MIATTR").selection("AGCHNO").index("00").build()
+    DBContainer container = query.getContainer()
+
+    container.setInt("AGCONO",    iCONO)
+    container.setLong("AGATNR",   iATNR)
+    container.setString("AGATID", iATID)
+    container.setInt("AGANSQ",    iANSQ)
+    container.setInt("AGAVSQ",    iAVSQ)
+
+    // readLock returns false if not found or cannot be locked — no pre-check read() needed
+    if (!query.readLock(container, updateMIATTRCallBack)) {
+      mi.error("Record does not exist or could not be locked in MIATTR for CONO: "
+        + iCONO + ", ATNR: " + iATNR + ", ATID: " + iATID)
+    }
+  }
+
+  // output written inside closure — only on confirmed successful update
+  Closure<?> updateMIATTRCallBack = {
+    LockedResult lockedResult ->
+    int miattrCHNO = lockedResult.getInt("AGCHNO")
+
+    lockedResult.setDouble("AGATVN", calATVN)
+    lockedResult.setInt("AGLMDT",    LocalDateTime.now().format(DATE_FMT).toInteger())
+    lockedResult.setInt("AGCHNO",    miattrCHNO + 1)
+    lockedResult.setString("AGCHID", program.getUser())
+    lockedResult.update()
+
+    mi.outData.put("CONO", iCONO.toString())
+    mi.outData.put("ATNR", iATNR.toString())
+    mi.outData.put("ATID", iATID.toString())
+    mi.outData.put("ATVN", calATVN.toString())
+    mi.write()
+  }
+}
